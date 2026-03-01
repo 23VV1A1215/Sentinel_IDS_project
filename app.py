@@ -8,13 +8,19 @@ import pandas as pd
 import joblib
 from flask import Flask, jsonify, render_template, request, redirect, url_for, session
 
+# ==========================
+# APP INIT
+# ==========================
+
 app = Flask(__name__)
 app.secret_key = "super_secret_key"
 
 RUNNING_IN_DOCKER = os.path.exists("/.dockerenv")
 CURRENT_MODE = "simulation"
 
-# ================= LOAD MODEL =================
+# ==========================
+# LOAD ML ARTIFACTS
+# ==========================
 
 model = joblib.load("models/XGBoost_Tuned.pkl")
 encoder = joblib.load("models/encoder.pkl")
@@ -22,7 +28,31 @@ scaler = joblib.load("models/scaler.pkl")
 numerical_cols = joblib.load("models/numerical_cols.pkl")
 categorical_cols = joblib.load("models/categorical_cols.pkl")
 
-# ================= DB INIT =================
+# ==========================
+# MITRE ATT&CK MAPPING
+# ==========================
+
+MITRE_MAPPING = {
+    "High": {
+        "category": "Denial of Service",
+        "mitre_id": "T1499",
+        "technique": "Endpoint Denial of Service"
+    },
+    "Medium": {
+        "category": "Network Scanning",
+        "mitre_id": "T1046",
+        "technique": "Network Service Discovery"
+    },
+    "Low": {
+        "category": "Benign / Low Risk Activity",
+        "mitre_id": "N/A",
+        "technique": "Normal Traffic"
+    }
+}
+
+# ==========================
+# DATABASE INIT
+# ==========================
 
 def init_db():
     conn = sqlite3.connect("predictions.db")
@@ -37,7 +67,10 @@ def init_db():
             attacks INTEGER,
             normals INTEGER,
             attack_percentage REAL,
-            severity TEXT
+            severity TEXT,
+            threat_category TEXT,
+            mitre_id TEXT,
+            technique TEXT
         )
     """)
 
@@ -46,79 +79,34 @@ def init_db():
 
 init_db()
 
-# ================= PREPROCESS =================
+# ==========================
+# PREPROCESS FUNCTION
+# ==========================
 
 def preprocess_input(df):
     df_cat = encoder.transform(df[categorical_cols])
     df_num = scaler.transform(df[numerical_cols])
     return np.hstack((df_num, df_cat))
 
-# ================= SIMULATION =================
+# ==========================
+# DETECTION ENGINE
+# ==========================
 
-def generate_simulated_batch(batch_size=100):
-
-    rows = []
-    attack_ratio = random.uniform(0.05, 0.8)
-    attack_count = int(batch_size * attack_ratio)
-
-    for i in range(batch_size):
-
-        row = {}
-        row["protocol_type"] = random.choice(["tcp", "udp", "icmp"])
-        row["service"] = random.choice(["http", "ftp", "smtp", "domain_u"])
-        row["flag"] = random.choice(["SF", "REJ", "S0"])
-
-        for col in numerical_cols:
-            if i < attack_count:
-                row[col] = random.uniform(0.8, 1.8)
-            else:
-                row[col] = random.uniform(0.0, 0.5)
-
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-# ================= CORE ML =================
 def run_detection():
 
     global CURRENT_MODE
 
-    # ------------------------
-    # Controlled traffic patterns
-    # ------------------------
-
+    # ---------- Traffic Pattern ----------
     if CURRENT_MODE == "simulation":
-
-        # 3 possible states
-        scenario = random.choice(["normal", "suspicious", "attack"])
-
-        if scenario == "normal":
-            attack_ratio = random.uniform(0.02, 0.12)
-        elif scenario == "suspicious":
-            attack_ratio = random.uniform(0.15, 0.35)
-        else:
-            attack_ratio = random.uniform(0.45, 0.75)
+        attack_ratio = random.uniform(0.05, 0.75)
 
     elif CURRENT_MODE == "real":
-
         if RUNNING_IN_DOCKER:
             return None
-
-        # real environment usually lower attack %
         attack_ratio = random.uniform(0.05, 0.25)
 
     else:  # hybrid
-
-        scenario = random.choice(["normal", "attack"])
-        if scenario == "normal":
-            attack_ratio = random.uniform(0.05, 0.20)
-        else:
-            attack_ratio = random.uniform(0.35, 0.60)
-
-      
-    # ------------------------
-    # Generate Data
-    # ------------------------
+        attack_ratio = random.uniform(0.10, 0.60)
 
     batch_size = 120
     attack_count = int(batch_size * attack_ratio)
@@ -142,14 +130,10 @@ def run_detection():
 
     df = pd.DataFrame(rows)
 
-    # ------------------------
-    # ML Inference
-    # ------------------------
-
+    # ---------- ML Inference ----------
     X = preprocess_input(df)
     probs = model.predict_proba(X)[:, 1]
 
-    # Use adaptive threshold (prevents over-high)
     preds = (probs > 0.75).astype(int)
 
     total = len(preds)
@@ -158,30 +142,28 @@ def run_detection():
 
     attack_percentage = round((attacks / total) * 100, 2)
 
-    # ------------------------
-    # Clean Severity Logic
-    # ------------------------
-
-    if attack_percentage < 30:
+    # ---------- Severity ----------
+    if attack_percentage < 20:
         severity = "Low"
     elif attack_percentage < 50:
         severity = "Medium"
     else:
         severity = "High"
 
+    # ---------- MITRE Mapping ----------
+    mitre_info = MITRE_MAPPING.get(severity, MITRE_MAPPING["Low"])
+
     source_ip = f"192.168.1.{random.randint(1,255)}"
 
-    # ------------------------
-    # DB Logging
-    # ------------------------
-
+    # ---------- Database Logging ----------
     conn = sqlite3.connect("predictions.db")
     cursor = conn.cursor()
 
     cursor.execute("""
         INSERT INTO logs
-        (timestamp, source_ip, total_records, attacks, normals, attack_percentage, severity)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        (timestamp, source_ip, total_records, attacks, normals,
+         attack_percentage, severity, threat_category, mitre_id, technique)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         source_ip,
@@ -189,7 +171,10 @@ def run_detection():
         attacks,
         normals,
         attack_percentage,
-        severity
+        severity,
+        mitre_info["category"],
+        mitre_info["mitre_id"],
+        mitre_info["technique"]
     ))
 
     conn.commit()
@@ -202,22 +187,15 @@ def run_detection():
         "attack_percentage": attack_percentage,
         "severity": severity,
         "source_ip": source_ip,
-        "mode": CURRENT_MODE
+        "mode": CURRENT_MODE,
+        "threat_category": mitre_info["category"],
+        "mitre_id": mitre_info["mitre_id"],
+        "technique": mitre_info["technique"]
     }
-# ================= Meta data End point =================
-@app.route('/api/model_info')
-def model_info():
-    return jsonify({
-        "model": "XGBoost",
-        "roc_auc": 0.96,
-        "deployment": "Docker + Gunicorn",
-        "environment": "Cloud"
-    })
-# ================= Health Endpoint =================
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy"})
-# ================= ROUTES =================
+
+# ==========================
+# ROUTES
+# ==========================
 
 @app.route('/')
 def dashboard():
@@ -254,7 +232,6 @@ def set_mode(mode):
 
 @app.route('/api/live')
 def live():
-
     result = run_detection()
 
     if result is None:
@@ -286,7 +263,8 @@ def logs():
     conn = sqlite3.connect("predictions.db")
 
     df = pd.read_sql_query("""
-        SELECT timestamp, source_ip, attack_percentage, severity
+        SELECT timestamp, source_ip, attack_percentage,
+               severity, threat_category, mitre_id, technique
         FROM logs
         ORDER BY id DESC
         LIMIT 10
@@ -295,6 +273,10 @@ def logs():
     conn.close()
 
     return jsonify(df.to_dict(orient="records"))
+
+# ==========================
+# MAIN
+# ==========================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
