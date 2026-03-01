@@ -204,6 +204,19 @@ def run_detection():
         "source_ip": source_ip,
         "mode": CURRENT_MODE
     }
+# ================= Meta data End point =================
+@app.route('/api/model_info')
+def model_info():
+    return jsonify({
+        "model": "XGBoost",
+        "roc_auc": 0.96,
+        "deployment": "Docker + Gunicorn",
+        "environment": "Cloud"
+    })
+# ================= Health Endpoint =================
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy"})
 # ================= ROUTES =================
 
 @app.route('/')
